@@ -50,6 +50,7 @@ docker-compose.override.yml
 # Temporary files
 *.tmp
 *.temp
+CLONES/
 
 # Project specific (adjust as needed)
-/cloneWep.py  # if this is a backup or temporary file
+cloneWep.py  # if this is a backup or temporary file

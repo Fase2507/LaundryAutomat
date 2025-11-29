@@ -284,7 +284,7 @@ template = """
                 <form method="post" action="/add_user">
                     <div class="form-group">
                         <label>Card ID:</label>
-                        <div style="display: flex; gap: 10px;">
+                        <div>
                             <input type="text" name="card_id" id="card_id" required placeholder="Scan card or enter manually">
                             <button type="button" class="btn btn-scan" onclick="getCard()">📡 Scan Card</button>
                         </div>
@@ -371,6 +371,8 @@ template = """
                     <div class="form-group">
                         <label>Card ID:</label>
                         <input type="text" name="card_id" required placeholder="Enter card ID">
+                        <button type="button" class="btn btn-scan" onclick="getCard()">📡 Scan Card</button>
+
                     </div>
 
                     <div class="form-group">
