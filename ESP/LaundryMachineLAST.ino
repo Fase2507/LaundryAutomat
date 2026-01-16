@@ -4,11 +4,10 @@
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <MFRC522.h>
-#include <ESPmDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
 #include "AdafruitIO_WiFi.h"
 #include "secret.h"
+// Add this line to fix the OTA update error
+#include <Update.h>
 // ============== PIN DEFINITIONS ==============
 #define RST_PIN 22
 #define SDA_PIN 5
@@ -23,26 +22,32 @@ enum WiFiMode {
   MODE_AP_ONLY     // Access Point only (local network)
 };
 
-WiFiMode currentMode = MODE_STATION; // Start with Station mode, fallback to AP
+WiFiMode currentMode = MODE_STATION;
 
-// ============== STATION MODE CONFIG ==============F
-const char* STATION_SSID = "TECNO";
-const char* STATION_PASSWORD = "qazwsx12";
-const char* STATION_SERVER_URL = "http://10.114.93.122:5000//scan_card";
+// ============== STATION MODE CONFIG (DUAL SSID) ==============
+// Primary WiFi (Try first - Your phone hotspot)
+const char* STATION_SSID_PRIMARY = "TECNO";
+const char* STATION_PASSWORD_PRIMARY = "qazwsx12";
+const char* STATION_SERVER_URL_PRIMARY = "http://10.114.93.122:5000/scan_card";
 
+// Secondary WiFi (Fallback - Dormitory WiFi)
+const char* STATION_SSID_SECONDARY = "DUZCEYURDU";
+const char* STATION_PASSWORD_SECONDARY = "duzceyurdu34!";
+const char* STATION_SERVER_URL_SECONDARY = "http://172.16.3.191:5000/scan_card";
+// Active configuration (set during connection)
+String activeSSID = "";
+String activeServerURL = "";
 
 // ============== ACCESS POINT CONFIG ==============
 const char* AP_SSID = "ESP32-RFID-Controller";
 const char* AP_PASSWORD = "laundry123";
 const char* AP_SERVER_URL = "http://192.168.4.4:5000/scan_card";
 
-
 // ============== GITHUB CONFIGURATIONS ==============
 const char* github_owner = "Fase2507";
 const char* github_repo = "ESP32-projects-OTA-for-firmwares";
 const char* firmware_asset_name = "LaundryMachineAdaFruit.ino.bin";
-const char* currentFirmwareVersion = "1.0.2";
-
+const char* currentFirmwareVersion = "1.0.6";
 
 // ============== SYSTEM CONSTANTS ==============
 const int MAX_COINS_PER_TRANSACTION = 10;
@@ -53,14 +58,13 @@ const unsigned long RELAY_PULSE_MS = 150;
 const unsigned long RELAY_PAUSE_MS = 500;
 const float BACKOFF_BASE = 1.5;
 const unsigned long BACKOFF_MAX_MS = 10000;
-const unsigned long WIFI_RETRY_INTERVAL = 30000; // Try reconnecting every 30s
-const int WIFI_CONNECT_TIMEOUT = 20; // 20 seconds timeout
+const unsigned long WIFI_RETRY_INTERVAL = 30000;
+const int WIFI_CONNECT_TIMEOUT = 20;
+const unsigned long FIRMWARE_CHECK_INTERVAL = 3600000; // Check every hour
 
 // ============== GLOBAL OBJECTS ==============
 MFRC522 rfid(SDA_PIN, RST_PIN);
-AdafruitIO_WiFi *io = nullptr; // Pointer, only initialize in Station mode
-
-// Feeds (only used in Station mode)
+AdafruitIO_WiFi *io = nullptr;
 AdafruitIO_Feed *coin_feed = nullptr;
 
 // ============== STATE VARIABLES ==============
@@ -72,31 +76,30 @@ bool relayActive = false;
 unsigned long relayStartTime = 0;
 int relayPulsesRemaining = 0;
 unsigned long relayPauseTime = 0;
+bool relayInitialized = false; 
 String currentCard = "";
 unsigned long lastWiFiCheck = 0;
 bool adafruitConnected = false;
-const unsigned long FIRMWARE_CHECK_INTERVAL = 3600000; // Check every hour (in milliseconds)
 unsigned long lastFirmwareCheck = 0;
+
 // ============== FUNCTION DECLARATIONS ==============
 void setupNetworking();
-bool connectStationMode();
+bool connectStationMode(const char* ssid, const char* password, const char* serverUrl);
 bool setupAccessPoint();
 void checkAndReconnectWiFi();
 void initializeAdafruitIO();
-void setupOTA();
+void checkFirmwareForUpdate();
+void downloadAndApplyFirmware(String url, int expectedSize);
 
 String readCardOnce();
 void activateRelay();
 void updateRelay();
 void processTransaction();
-
 bool scanCardDisplay(String cardId);
 bool sendTransactionToServer(String cardId, int coins, String machine_id);
 void sendToAdafruit(String cardId, int coins);
-
 String getServerURL();
 String getModeString();
-
 
 // ============================================
 //              SETUP
@@ -104,31 +107,35 @@ String getModeString();
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("ESP 32 Mac ADDRESS IS ");
-  Serial.println(WiFi.macAddress());
-  Serial.println("Current firmware version is ===>>> "+ String(currentFirmwareVersion));
-  Serial.println("GITHUB IS WORKING");
+  
   Serial.println("\n\n╔════════════════════════════════════════╗");
   Serial.println("║  ESP32 RFID Laundry Controller v2.0   ║");
-  Serial.println("║  Dual Mode: Station/AP + OTA Support   ║");
+  Serial.println("║  Dual WiFi + GitHub OTA Support        ║");
   Serial.println("╚════════════════════════════════════════╝\n");
+  
+  Serial.println("ESP32 MAC Address: " + WiFi.macAddress());
+  Serial.println("Current Firmware Version: " + String(currentFirmwareVersion));
+  
   // Configure relay pin
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // Relay OFF (active-low)
-  
+  // relayPulsesRemaining = 0;      // ← ADD THIS
+  relayActive = false;           
+  relayInitialized = true;
   // Initialize SPI and RFID
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SDA_PIN);
   rfid.PCD_Init();
   
-  Serial.println("✓ RFID Reader initialized");
+  Serial.println("\n✓ RFID Reader initialized");
   rfid.PCD_DumpVersionToSerial();
   
-  // Setup networking (tries Station, falls back to AP)
+  // Setup networking (tries Primary, then Secondary, then AP)
   setupNetworking();
-  checkFirmwareForUpdate();
-
-  // Setup OTA updates
-  // setupOTA();
+  
+  // Check for firmware updates (only if connected to internet)
+  if (currentMode == MODE_STATION && WiFi.status() == WL_CONNECTED) {
+    checkFirmwareForUpdate();
+  }
   
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║         SYSTEM READY                   ║");
@@ -139,23 +146,21 @@ void setup() {
   Serial.println("\nWaiting for cards...\n");
 }
 
-
 // ============================================
 //              MAIN LOOP
 // ============================================
 void loop() {
   unsigned long now = millis();
   
-  // Handle OTA updates
-  // ArduinoOTA.handle();
+  // Periodic firmware update check (only in Station mode with internet)
   if (currentMode == MODE_STATION && 
       WiFi.status() == WL_CONNECTED && 
       (now - lastFirmwareCheck >= FIRMWARE_CHECK_INTERVAL)) {
-    
     Serial.println("\n⏰ Periodic firmware check...");
     checkFirmwareForUpdate();
     lastFirmwareCheck = now;
   }
+  
   // Handle Adafruit IO (only in Station mode)
   if (currentMode == MODE_STATION && adafruitConnected && io != nullptr) {
     io->run();
@@ -220,45 +225,55 @@ void loop() {
     processTransaction();
   }
   
-  delay(50); // Small delay to prevent watchdog issues
+  delay(50);
 }
-
 
 // ============================================
 //          NETWORKING FUNCTIONS
 // ============================================
-
 void setupNetworking() {
-  Serial.println("\n═══ Network Setup ═══");
+  Serial.println("\n═══ Network Setup (Dual SSID Mode) ═══");
   
-  // Try Station mode first
-  if (connectStationMode()) {
+  // Try Primary WiFi first (TECNO - Phone Hotspot)
+  if (connectStationMode(STATION_SSID_PRIMARY, STATION_PASSWORD_PRIMARY, STATION_SERVER_URL_PRIMARY)) {
     currentMode = MODE_STATION;
-    Serial.println("✓ Operating in STATION MODE (Internet available)");
-    
-    // Initialize Adafruit IO
+    Serial.println("✓ Connected to PRIMARY WiFi: " + String(STATION_SSID_PRIMARY));
+    activeSSID = STATION_SSID_PRIMARY;
+    activeServerURL = STATION_SERVER_URL_PRIMARY;
     initializeAdafruitIO();
-    
+    return;
+  }
+  
+  Serial.println("⚠ Primary WiFi failed, trying secondary...");
+  
+  // Try Secondary WiFi (DUZCEYURDU - Dormitory)
+  if (connectStationMode(STATION_SSID_SECONDARY, STATION_PASSWORD_SECONDARY, STATION_SERVER_URL_SECONDARY)) {
+    currentMode = MODE_STATION;
+    Serial.println("✓ Connected to SECONDARY WiFi: " + String(STATION_SSID_SECONDARY));
+    activeSSID = STATION_SSID_SECONDARY;
+    activeServerURL = STATION_SERVER_URL_SECONDARY;
+    initializeAdafruitIO();
+    return;
+  }
+  
+  Serial.println("⚠ Both Station modes failed, switching to AP MODE");
+  
+  // Fallback to AP mode
+  currentMode = MODE_AP_ONLY;
+  if (setupAccessPoint()) {
+    Serial.println("✓ Operating in AP-ONLY MODE (Local network)");
+    activeSSID = AP_SSID;
+    activeServerURL = AP_SERVER_URL;
   } else {
-    // Fallback to AP mode
-    currentMode = MODE_AP_ONLY;
-    Serial.println("⚠ Station mode failed, switching to AP MODE");
-    
-    if (setupAccessPoint()) {
-      Serial.println("✓ Operating in AP-ONLY MODE (Local network)");
-    } else {
-      Serial.println("✗ CRITICAL: Both modes failed!");
-    }
+    Serial.println("✗ CRITICAL: All connection modes failed!");
   }
 }
 
-bool connectStationMode() {
-  Serial.println("Attempting STATION mode connection...");
-  Serial.print("SSID: ");
-  Serial.println(STATION_SSID);
+bool connectStationMode(const char* ssid, const char* password, const char* serverUrl) {
+  Serial.println("Attempting connection to: " + String(ssid));
   
   WiFi.mode(WIFI_STA);
-  WiFi.begin(STATION_SSID, STATION_PASSWORD);
+  WiFi.begin(ssid, password);
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < WIFI_CONNECT_TIMEOUT) {
@@ -270,22 +285,22 @@ bool connectStationMode() {
   
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("✓ WiFi connected!");
-    Serial.print("  IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("  Signal strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
+    Serial.println("  SSID: " + String(ssid));
+    Serial.println("  IP address: " + WiFi.localIP().toString());
+    Serial.println("  Signal strength: " + String(WiFi.RSSI()) + " dBm");
+    Serial.println("  Server URL: " + String(serverUrl));
     return true;
   } else {
-    Serial.println("✗ Station mode connection failed");
+    Serial.println("✗ Connection to " + String(ssid) + " failed");
+    WiFi.disconnect(true);
+    delay(1000);
     return false;
   }
 }
 
 bool setupAccessPoint() {
   Serial.println("Setting up Access Point...");
-  Serial.print("SSID: ");
-  Serial.println(AP_SSID);
+  Serial.println("SSID: " + String(AP_SSID));
   
   WiFi.mode(WIFI_AP);
   
@@ -297,10 +312,8 @@ bool setupAccessPoint() {
   delay(1000);
   
   Serial.println("✓ Access Point created successfully!");
-  Serial.print("  AP IP address: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.print("  AP MAC address: ");
-  Serial.println(WiFi.softAPmacAddress());
+  Serial.println("  AP IP address: " + WiFi.softAPIP().toString());
+  Serial.println("  AP MAC address: " + WiFi.softAPmacAddress());
   Serial.println("\n  Connection Info for Raspberry Pi:");
   Serial.println("  ─────────────────────────────────");
   Serial.println("  SSID: " + String(AP_SSID));
@@ -314,7 +327,6 @@ bool setupAccessPoint() {
 void checkAndReconnectWiFi() {
   unsigned long now = millis();
   
-  // Only check periodically
   if (now - lastWiFiCheck < WIFI_RETRY_INTERVAL) {
     return;
   }
@@ -323,27 +335,58 @@ void checkAndReconnectWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("\n⚠ WiFi disconnected! Attempting reconnection...");
     
-    if (connectStationMode()) {
-      Serial.println("✓ WiFi reconnected successfully");
-      // Reinitialize Adafruit if needed
-      if (!adafruitConnected) {
-        initializeAdafruitIO();
-      }
-    } else {
-      Serial.println("✗ Reconnection failed, switching to AP mode");
-      currentMode = MODE_AP_ONLY;
-      setupAccessPoint();
+    // Try primary first
+    if (connectStationMode(STATION_SSID_PRIMARY, STATION_PASSWORD_PRIMARY, STATION_SERVER_URL_PRIMARY)) {
+      Serial.println("✓ Reconnected to PRIMARY WiFi");
+      activeSSID = STATION_SSID_PRIMARY;
+      activeServerURL = STATION_SERVER_URL_PRIMARY;
+      currentMode = MODE_STATION;
+      if (!adafruitConnected) initializeAdafruitIO();
+      return;
     }
+    
+    // Try secondary
+    if (connectStationMode(STATION_SSID_SECONDARY, STATION_PASSWORD_SECONDARY, STATION_SERVER_URL_SECONDARY)) {
+      Serial.println("✓ Reconnected to SECONDARY WiFi");
+      activeSSID = STATION_SSID_SECONDARY;
+      activeServerURL = STATION_SERVER_URL_SECONDARY;
+      currentMode = MODE_STATION;
+      if (!adafruitConnected) initializeAdafruitIO();
+      return;
+    }
+    
+    // Both failed, switch to AP
+    Serial.println("✗ Reconnection failed, switching to AP mode");
+    currentMode = MODE_AP_ONLY;
+    activeSSID = AP_SSID;
+    activeServerURL = AP_SERVER_URL;
+    setupAccessPoint();
   }
 }
 
 void initializeAdafruitIO() {
   Serial.println("\n═══ Initializing Adafruit IO ═══");
   
-  // Create Adafruit IO object
-  io = new AdafruitIO_WiFi(IO_USERNAME, IO_KEY, STATION_SSID, STATION_PASSWORD);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ Not connected to WiFi, skipping Adafruit IO");
+    adafruitConnected = false;
+    return;
+  }
   
-  // Connect to Adafruit IO
+  const char* currentSSID = activeSSID.c_str();
+  const char* currentPassword = "";
+  
+  if (activeSSID == STATION_SSID_PRIMARY) {
+    currentPassword = STATION_PASSWORD_PRIMARY;
+  } else if (activeSSID == STATION_SSID_SECONDARY) {
+    currentPassword = STATION_PASSWORD_SECONDARY;
+  } else {
+    Serial.println("⚠ Unknown SSID, skipping Adafruit IO");
+    adafruitConnected = false;
+    return;
+  }
+  
+  io = new AdafruitIO_WiFi(IO_USERNAME, IO_KEY, currentSSID, currentPassword);
   io->connect();
   
   int attempts = 0;
@@ -357,101 +400,18 @@ void initializeAdafruitIO() {
   if (io->status() >= AIO_CONNECTED) {
     Serial.println("✓ Adafruit IO connected!");
     Serial.println("  Status: " + String(io->statusText()));
-    
-    // Initialize feed
     coin_feed = io->feed("laundry-machine");
     adafruitConnected = true;
   } else {
-    Serial.println("⚠ Adafruit IO connection failed");
+    Serial.println("⚠ Adafruit IO connection failed (likely captive portal)");
     Serial.println("  Continuing without cloud features");
     adafruitConnected = false;
   }
 }
 
-
 // ============================================
-//          OTA UPDATE FUNCTIONS
+//      GITHUB FIRMWARE UPDATE FUNCTIONS
 // ============================================
-
-void setupOTA() {
-  Serial.println("\n═══ Initializing OTA Updates ═══");
-  
-  // Set OTA hostname
-  ArduinoOTA.setHostname("ESP32-RFID-Laundry");
-  
-  // Set OTA password for security
-  ArduinoOTA.setPassword("laundry_ota_2025");
-  
-  // OTA callbacks
-  ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else { // U_SPIFFS
-      type = "filesystem";
-    }
-    Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║         OTA UPDATE STARTED             ║");
-    Serial.println("╚════════════════════════════════════════╝");
-    Serial.println("Type: " + type);
-    
-    // Disable relay during update
-    digitalWrite(RELAY_PIN, HIGH);
-  });
-  
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\n✓ OTA Update completed successfully!");
-    Serial.println("Rebooting...");
-  });
-  
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    static unsigned int lastPercent = 0;
-    unsigned int percent = (progress / (total / 100));
-    
-    if (percent != lastPercent && percent % 10 == 0) {
-      Serial.printf("Progress: %u%%\n", percent);
-      lastPercent = percent;
-    }
-  });
-  
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("\n✗ OTA Error[%u]: ", error);
-    switch (error) {
-      case OTA_AUTH_ERROR:
-        Serial.println("Auth Failed");
-        break;
-      case OTA_BEGIN_ERROR:
-        Serial.println("Begin Failed");
-        break;
-      case OTA_CONNECT_ERROR:
-        Serial.println("Connect Failed");
-        break;
-      case OTA_RECEIVE_ERROR:
-        Serial.println("Receive Failed");
-        break;
-      case OTA_END_ERROR:
-        Serial.println("End Failed");
-        break;
-    }
-  });
-  
-  ArduinoOTA.begin();
-  
-  Serial.println("✓ OTA ready");
-  Serial.println("  Hostname: ESP32-RFID-Laundry");
-  Serial.println("  Password: laundry_ota_2025");
-  
-  // Only show IP in Station mode
-  if (currentMode == MODE_STATION) {
-    Serial.println("  IP: " + WiFi.localIP().toString());
-  }
-}
-
-
-// ============================================
-//      UPDATED FIRMWARE UPDATE FUNCTIONS
-// ============================================
-
 void checkFirmwareForUpdate() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠ WiFi not connected. Skipping firmware update check.");
@@ -467,20 +427,16 @@ void checkFirmwareForUpdate() {
   Serial.println("Current version: " + String(currentFirmwareVersion));
   Serial.println("Repository: " + String(github_owner) + "/" + String(github_repo));
   Serial.println("Fetching: " + apiUrl);
- 
-  // Add root CA certificate for HTTPS
+
   WiFiClientSecure client;
-  client.setInsecure(); // For testing - skip certificate verification
+  client.setInsecure();
   
   HTTPClient http;
-  http.begin(client, apiUrl); // Use secure client
-  http.setTimeout(15000); // 15 second timeout
-  
-  // GitHub API headers
+  http.begin(client, apiUrl);
+  http.setTimeout(15000);
   http.addHeader("Accept", "application/vnd.github.v3+json");
   http.addHeader("User-Agent", "ESP32-OTA-Client");
   
-  // Only add token if it's defined and not empty
   if (strlen(git_tkn) > 0) {
     http.addHeader("Authorization", "token " + String(git_tkn));
     Serial.println("✓ Using GitHub token for authentication");
@@ -490,37 +446,27 @@ void checkFirmwareForUpdate() {
 
   Serial.println("→ Sending API request...");
   int httpCode = http.GET();
-
   Serial.printf("← Received HTTP code: %d\n", httpCode);
 
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("✗ API request failed. HTTP code: %d\n", httpCode);
     
-    // Detailed error explanation
     switch(httpCode) {
       case -1:
-        Serial.println("  Error: Connection failed");
-        Serial.println("  Possible causes:");
-        Serial.println("  - SSL/TLS certificate issue");
-        Serial.println("  - Firewall blocking HTTPS");
-        Serial.println("  - DNS resolution failure");
-        Serial.println("  - Network connectivity issue");
+        Serial.println("  Error: Connection failed (SSL/TLS or network issue)");
         break;
       case 401:
-        Serial.println("  Error: Unauthorized - Check your GitHub token");
+        Serial.println("  Error: Unauthorized - Check GitHub token");
         break;
       case 403:
         Serial.println("  Error: Forbidden - Token may lack permissions");
         break;
       case 404:
         Serial.println("  Error: Repository or release not found");
-        Serial.println("  Check: " + String(github_owner) + "/" + String(github_repo));
         break;
       default:
         if (httpCode > 0) {
           Serial.println("  Response: " + http.getString());
-        } else {
-          Serial.println("  Error: " + http.errorToString(httpCode));
         }
     }
     http.end();
@@ -529,15 +475,13 @@ void checkFirmwareForUpdate() {
   
   Serial.printf("✓ API request successful (HTTP %d)\n", httpCode);
 
-  // Create a filter to only parse what we need (saves memory)
   StaticJsonDocument<200> filter;
   filter["tag_name"] = true;
   filter["assets"][0]["name"] = true;
   filter["assets"][0]["id"] = true;
   filter["assets"][0]["size"] = true;
 
-  // Allocate document for the response
-  DynamicJsonDocument doc(4096); // 16KB should be enough
+  DynamicJsonDocument doc(4096);
   
   Serial.println("→ Parsing JSON response...");
   DeserializationError error = deserializeJson(doc, http.getStream(), 
@@ -550,7 +494,6 @@ void checkFirmwareForUpdate() {
     return;
   }
 
-  // Extract version
   String latestVersion = doc["tag_name"].as<String>();
   if (latestVersion.isEmpty() || latestVersion == "null") {
     Serial.println("✗ Could not find 'tag_name' in response");
@@ -560,7 +503,6 @@ void checkFirmwareForUpdate() {
   
   Serial.println("Latest version: " + latestVersion);
 
-  // Check if update is needed
   if (latestVersion == currentFirmwareVersion) {
     Serial.println("✓ Firmware is up to date!");
     Serial.println("════════════════════════════════════════\n");
@@ -581,7 +523,6 @@ void checkFirmwareForUpdate() {
     return;
   }
 
-  // Find matching asset
   for (JsonObject asset : assets) {
     String assetName = asset["name"].as<String>();
     Serial.println("  Found asset: " + assetName);
@@ -600,7 +541,7 @@ void checkFirmwareForUpdate() {
     }
   }
   
-  http.end(); // Close API connection before starting download
+  http.end();
 
   if (firmwareUrl.isEmpty()) {
     Serial.println("✗ Firmware asset not found: " + String(firmware_asset_name));
@@ -608,7 +549,6 @@ void checkFirmwareForUpdate() {
     return;
   }
   
-  // Start firmware download
   Serial.println("════════════════════════════════════════");
   downloadAndApplyFirmware(firmwareUrl, assetSize);
 }
@@ -622,13 +562,19 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
     Serial.println("Expected size: " + String(expectedSize) + " bytes");
   }
 
+  WiFiClientSecure client;
+  client.setInsecure();
+  
   HTTPClient http;
-  http.begin(url);
-  http.setTimeout(30000); // 30 second timeout for download
+  http.begin(client, url);
+  http.setTimeout(30000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("ESP32-OTA-Client");
   http.addHeader("Accept", "application/octet-stream");
-  http.addHeader("Authorization", "token " + String(git_tkn));
+  
+  if (strlen(git_tkn) > 0) {
+    http.addHeader("Authorization", "token " + String(git_tkn));
+  }
 
   Serial.println("→ Requesting firmware file...");
   int httpCode = http.GET();
@@ -651,20 +597,17 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
     return;
   }
 
-  // Verify we have enough space
-  if (contentLength > UPDATE_SIZE_UNKNOWN) {
+  if (contentLength > 1310720) {
     Serial.println("✗ Firmware too large for ESP32 flash");
     http.end();
     return;
   }
 
-  // Disable relay during update for safety
   digitalWrite(RELAY_PIN, HIGH);
   relayActive = false;
   relayPulsesRemaining = 0;
   Serial.println("⚠ Relay disabled for update safety");
 
-  // Begin OTA update
   Serial.println("→ Initializing OTA update...");
   if (!Update.begin(contentLength)) {
     Serial.printf("✗ Update.begin() failed: %s\n", Update.errorString());
@@ -676,15 +619,13 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
   Serial.println("┌────────────────────────────────────────┐");
   
   WiFiClient* stream = http.getStreamPtr();
-  uint8_t buff[512]; // Smaller buffer for stability
+  uint8_t buff[512];
   size_t totalWritten = 0;
   int lastProgress = -1;
   unsigned long startTime = millis();
 
-  // Write firmware data
   while (totalWritten < contentLength) {
-    // Check for timeout
-    if (millis() - startTime > 120000) { // 2 minute timeout
+    if (millis() - startTime > 120000) {
       Serial.println("\n✗ Download timeout!");
       Update.abort();
       http.end();
@@ -712,13 +653,11 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
 
       totalWritten += written;
 
-      // Update progress every 5%
       int progress = (totalWritten * 100) / contentLength;
       if (progress != lastProgress && (progress % 5 == 0 || progress == 100)) {
         Serial.printf("│ Progress: %3d%% [%d/%d bytes]", 
                       progress, totalWritten, contentLength);
         
-        // Show download speed
         unsigned long elapsed = millis() - startTime;
         if (elapsed > 0) {
           float speed = (totalWritten / 1024.0) / (elapsed / 1000.0);
@@ -729,16 +668,14 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
         lastProgress = progress;
       }
     } else {
-      delay(1); // Small delay when no data available
+      delay(1);
     }
     
-    // Feed watchdog
     yield();
   }
 
   Serial.println("└────────────────────────────────────────┘");
 
-  // Verify write completed
   if (totalWritten != contentLength) {
     Serial.printf("✗ Write incomplete! Wrote %d of %d bytes\n", 
                   totalWritten, contentLength);
@@ -747,15 +684,13 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
     return;
   }
 
-  // Finalize update
   Serial.println("→ Finalizing update...");
-  if (!Update.end(true)) { // true = set new firmware as boot partition
+  if (!Update.end(true)) {
     Serial.printf("✗ Update.end() failed: %s\n", Update.errorString());
     http.end();
     return;
   }
 
-  // Verify update
   if (!Update.isFinished()) {
     Serial.println("✗ Update not finished!");
     http.end();
@@ -770,14 +705,13 @@ void downloadAndApplyFirmware(String url, int expectedSize) {
   Serial.println("\nRebooting in 3 seconds...");
   
   http.end();
-  
   delay(3000);
   ESP.restart();
 }
+
 // ============================================
 //          TRANSACTION FUNCTIONS
 // ============================================
-
 void processTransaction() {
   if (!transactionInProgress || totalCoins == 0) {
     return;
@@ -790,14 +724,12 @@ void processTransaction() {
   Serial.println("Total Coins: " + String(totalCoins));
   Serial.println("Mode: " + getModeString());
   
-  // Send to server
   if (sendTransactionToServer(currentCard, totalCoins, "laundry_machine_1")) {
     Serial.println("✓ Transaction successful");
   } else {
     Serial.println("✗ Transaction failed!");
   }
   
-  // Reset state
   transactionInProgress = false;
   currentCard = "";
   totalCoins = 0;
@@ -812,15 +744,12 @@ bool sendTransactionToServer(String cardId, int coins, String machine_id) {
   
   while (retryCount < maxRetries) {
     HTTPClient http;
-    
-    // Use appropriate URL based on mode
     String serverURL = getServerURL();
     
     http.begin(serverURL);
-    http.setTimeout(5000); // 5 second timeout
+    http.setTimeout(5000);
     http.addHeader("Content-Type", "application/json");
     
-    // Create JSON payload
     StaticJsonDocument<256> doc;
     doc["card_id"] = cardId;
     doc["coins"] = coins;
@@ -841,7 +770,6 @@ bool sendTransactionToServer(String cardId, int coins, String machine_id) {
       Serial.print("← Server response: ");
       Serial.println(response);
       
-      // Parse JSON response
       StaticJsonDocument<512> responseDoc;
       DeserializationError error = deserializeJson(responseDoc, response);
       
@@ -875,7 +803,6 @@ bool sendTransactionToServer(String cardId, int coins, String machine_id) {
           Serial.println(" times");
           activateRelay();
           
-          // Send to Adafruit IO only in Station mode
           if (currentMode == MODE_STATION && adafruitConnected) {
             sendToAdafruit(cardId, coins);
           }
@@ -894,7 +821,6 @@ bool sendTransactionToServer(String cardId, int coins, String machine_id) {
       Serial.println("✗ Error: " + http.errorToString(httpResponseCode));
       http.end();
       
-      // Exponential backoff
       unsigned long sleepTime = min((unsigned long)(backoff * 1000), BACKOFF_MAX_MS);
       Serial.print("⏳ Retrying in ");
       Serial.print(sleepTime / 1000);
@@ -912,8 +838,8 @@ bool sendTransactionToServer(String cardId, int coins, String machine_id) {
 
 bool scanCardDisplay(String cardId) {
   HTTPClient http;
-  
   String serverURL = getServerURL();
+  
   http.begin(serverURL);
   http.setTimeout(3000);
   http.addHeader("Content-Type", "application/json");
@@ -937,8 +863,6 @@ void sendToAdafruit(String cardId, int coins) {
   }
   
   Serial.println("→ Sending to Adafruit IO...");
-  
-  // Send coins value to feed
   coin_feed->save(coins);
   
   Serial.println("✓ Data sent to Adafruit IO");
@@ -946,11 +870,9 @@ void sendToAdafruit(String cardId, int coins) {
   Serial.println("  Value: " + String(coins));
 }
 
-
 // ============================================
 //          RFID & RELAY FUNCTIONS
 // ============================================
-
 String readCardOnce() {
   if (!rfid.PICC_IsNewCardPresent()) {
     return "";
@@ -969,7 +891,6 @@ String readCardOnce() {
   }
   cardId.toUpperCase();
   
-  // Halt PICC and stop encryption
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
   
@@ -986,7 +907,7 @@ void activateRelay() {
   Serial.println("║   RELAY ACTIVATED         ║");
   Serial.println("╚═══════════════════════════╝");
   
-  digitalWrite(RELAY_PIN, LOW);   // Relay ON (active-low)
+  digitalWrite(RELAY_PIN, LOW);
   relayActive = true;
   relayStartTime = millis();
   
@@ -999,48 +920,36 @@ void updateRelay() {
   unsigned long now = millis();
   
   if (relayActive) {
-    // Check if pulse duration is complete
     if (now - relayStartTime >= RELAY_PULSE_MS) {
-      digitalWrite(RELAY_PIN, HIGH);  // Relay OFF
+      digitalWrite(RELAY_PIN, HIGH);
       relayActive = false;
       relayPulsesRemaining--;
       
       Serial.print("⚡ Relay pulse completed. Remaining: ");
       Serial.println(relayPulsesRemaining);
       
-      // Start pause timer if more pulses needed
       if (relayPulsesRemaining > 0) {
         relayPauseTime = now;
       }
     }
   } else if (relayPulsesRemaining > 0) {
-    // Check if pause duration is complete
     if (now - relayPauseTime >= RELAY_PAUSE_MS) {
-      activateRelay();  // Start next pulse
+      activateRelay();
     }
   }
 }
 
-
 // ============================================
 //          UTILITY FUNCTIONS
 // ============================================
-
 String getServerURL() {
-  switch (currentMode) {
-    case MODE_STATION:
-      return STATION_SERVER_URL;
-    case MODE_AP_ONLY:
-      return AP_SERVER_URL;
-    default:
-      return AP_SERVER_URL;
-  }
+  return activeServerURL;
 }
 
 String getModeString() {
   switch (currentMode) {
     case MODE_STATION:
-      return "STATION (Internet)";
+      return "STATION (" + activeSSID + ")";
     case MODE_AP_ONLY:
       return "AP-ONLY (Local)";
     default:
