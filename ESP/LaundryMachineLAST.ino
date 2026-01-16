@@ -76,7 +76,6 @@ bool relayActive = false;
 unsigned long relayStartTime = 0;
 int relayPulsesRemaining = 0;
 unsigned long relayPauseTime = 0;
-bool relayInitialized = false; 
 String currentCard = "";
 unsigned long lastWiFiCheck = 0;
 bool adafruitConnected = false;
@@ -121,7 +120,6 @@ void setup() {
   digitalWrite(RELAY_PIN, HIGH); // Relay OFF (active-low)
   // relayPulsesRemaining = 0;      // ← ADD THIS
   relayActive = false;           
-  relayInitialized = true;
   // Initialize SPI and RFID
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SDA_PIN);
   rfid.PCD_Init();
