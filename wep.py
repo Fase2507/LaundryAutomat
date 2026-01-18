@@ -1,8 +1,11 @@
 from flask import Flask, request, render_template_string, redirect, jsonify, send_from_directory
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
+
+
+
 
 app = Flask(__name__)
 
@@ -657,7 +660,7 @@ def init_db():
         username TEXT,
         action TEXT,
         balance INTEGER,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        timestamp DATETIME DEFAULT (datetime('now','+3 hours'))
     )''')
    
     conn.commit()
@@ -672,9 +675,16 @@ def get_db():
 def log_action(card_id, username, action, balance):
     """Log an action to the database"""
     try:
+        #utc = pytz.utc
+        #tr = pytz.timezone("Europe/Istanbul")
+
+        #utc_time = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S")
+        #local_time = utc.localize(utc_time).astimezone(tr)
+    
         conn = get_db()
         c = conn.cursor()
-        c.execute("INSERT INTO logs (card_id, username, action, balance) VALUES (?, ?, ?, ?)",
+        #istanbul_time = (datetime.utcnow() + timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO logs (card_id, username, action, balance) VALUES (?,?, ?, ?, ?)",
                   (card_id, username, action, balance))
         conn.commit()
         conn.close()
@@ -831,6 +841,11 @@ def scan_card():
     Handle RFID card scanning from ESP32
     This is the main endpoint ESP32 uses for transactions
     """
+    # Around line 440, replace this line:
+#    "timestamp": datetime.now().isoformat()
+
+    # With this:
+ #   "timestamp": (datetime.utcnow() + timedelta(hours=3)).isoformat()
     global LAST_RFID
     
     try:
